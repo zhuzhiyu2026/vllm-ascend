@@ -16,8 +16,15 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import enable_pcp
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
+from vllm_ascend.spec_dfx import (
+    active as spec_dfx_active,
+    dump as spec_dfx_dump,
+)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compute_num_programs
 from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -242,6 +249,24 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_seed_buffer[:n].copy_(next_token_ids)
         self._dspark_seed_buffer[n:].fill_(0)
         batch_size = cad.num_reqs
+
+        # [spec/dfx2] A2: seed actually written into the drafter + reject-trim
+        # counts + context length. The temporal signature (acceptance healthy
+        # at startup, collapsing later) makes seq_lens growth vs the transition
+        # step the primary correlation axis.
+        if spec_dfx_active(logger):
+            spec_dfx_dump(
+                logger,
+                "A2.seed_inputs",
+                seed=self._dspark_seed_buffer[:2],
+                next_token_ids=next_token_ids[:4],
+                num_rejected=(num_rejected_tokens_gpu[:4] if num_rejected_tokens_gpu is not None else None),
+                seq_lens=cad.seq_lens[:4],
+                max_seq_len=cad.max_seq_len,
+                batch_size=batch_size,
+                num_query_per_req=self.num_query_per_req,
+                sample_from_anchor=self.sample_from_anchor,
+            )
         num_query_total = batch_size * self.num_query_per_req
         num_sample_total = batch_size * self.num_speculative_tokens
         has_num_rejected = num_rejected_tokens_gpu is not None

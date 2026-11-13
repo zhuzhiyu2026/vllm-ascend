@@ -387,6 +387,13 @@ def sample_recovered_tokens_kernel(
                 q_ptr + req_idx * vocab_size + vocab_offset, mask=vocab_offset < vocab_size, other=float("-inf")
             )
             new_p = prob / q
+            # [spec/dfx2] NaN guard: 0/0 (prob=0 where q=0) and any NaN from
+            # upstream numerical anomalies must not poison the argmax/
+            # comparison chain -- a NaN max_p fails `max_p > global_max_p`,
+            # leaking the -1 sentinel into the output (reads back as
+            # PLACEHOLDER and freezes the sequence). Treat NaN as 0
+            # probability so the sentinel can never be stored.
+            new_p = tl.where(new_p == new_p, new_p, 0.0)
             recovered_id = tl.argmax(new_p, axis=-1)
             max_p = get_element(new_p, (recovered_id,))
             if max_p > global_max_p:
@@ -414,6 +421,9 @@ def sample_recovered_tokens_kernel(
                 q_ptr + req_idx * vocab_size + vocab_offset, mask=vocab_offset < vocab_size, other=float("-inf")
             )
             new_p = prob / q
+            # [spec/dfx2] NaN guard, same rationale as the NO_DRAFT_PROBS
+            # branch above: NaN must never reach `max_p > global_max_p`.
+            new_p = tl.where(new_p == new_p, new_p, 0.0)
             recovered_id = tl.argmax(new_p, axis=-1)
             max_p = get_element(new_p, (recovered_id,))
             if max_p > global_max_p:

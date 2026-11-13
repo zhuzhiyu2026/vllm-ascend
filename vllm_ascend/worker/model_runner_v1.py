@@ -121,6 +121,11 @@ from vllm.v1.worker.utils import (
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.spec_dfx import (
+    active as spec_dfx_active,
+    dump as spec_dfx_dump,
+    next_step as spec_dfx_next_step,
+)
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -1908,6 +1913,49 @@ class NPUModelRunner(GPUModelRunner):
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
         self._log_propose_draft_token_ids_entry(spec_decode_metadata, num_scheduled_tokens)
+
+        # [spec/dfx2] A1: seed source (prev-step sampled tokens) + batch identity
+        # + CPU-side metadata (num_computed tokens, sequence tails, CPU-side
+        # scheduled drafts, previous verify output) for host/device accounting
+        # drift analysis.
+        if spec_dfx_active(logger):
+            spec_dfx_next_step()
+            sampled = (
+                valid_sampled_token_ids[:4].tolist()
+                if isinstance(valid_sampled_token_ids, torch.Tensor)
+                else valid_sampled_token_ids
+            )
+            cpu_meta: dict = {}
+            try:
+                nc = self.input_batch.num_computed_tokens_cpu
+                tids = self.input_batch.token_ids_cpu
+                nr = min(2, int(self.input_batch.num_reqs))
+                ns = [int(nc[i]) for i in range(nr)]
+                cpu_meta["cpu_num_computed"] = ns
+                cpu_meta["cpu_seq_tail"] = [
+                    tids[i, max(0, ns[i] - 6):ns[i]].tolist() for i in range(nr)
+                ]
+            except Exception:
+                cpu_meta["cpu_metadata"] = "unavailable"
+                ns = []
+            try:
+                cpu_meta["cpu_scheduled_drafts"] = [
+                    (rid, list(ids)[:6])
+                    for rid, ids in list(scheduler_output.scheduled_spec_decode_tokens.items())[:2]
+                ]
+            except Exception:
+                pass
+            prev = getattr(self.input_batch, "prev_sampled_token_ids", None)
+            spec_dfx_dump(
+                logger,
+                "A1.propose_entry",
+                num_reqs=self.input_batch.num_reqs,
+                req_ids=list(self.input_batch.req_ids[:4]),
+                valid_sampled=sampled,  # padded raw sampled ids; -1 = rejected/invalid
+                num_scheduled_tokens=num_scheduled_tokens,
+                prev_sampled=(prev.reshape(-1)[:4] if prev is not None else None),
+                **cpu_meta,
+            )
 
         # Reset cached draft probs from the previous step so that stale data
         # is never used when the drafter does not produce fresh probabilities.
