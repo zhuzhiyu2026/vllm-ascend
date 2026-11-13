@@ -121,6 +121,11 @@ from vllm.v1.worker.utils import (
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.spec_dfx import (
+    active as spec_dfx_active,
+    dump as spec_dfx_dump,
+    next_step as spec_dfx_next_step,
+)
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -2017,6 +2022,23 @@ class NPUModelRunner(GPUModelRunner):
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
         self._log_propose_draft_token_ids_entry(spec_decode_metadata, num_scheduled_tokens)
+
+        # [spec/dfx2] A1: seed source (prev-step sampled tokens) + batch identity.
+        if spec_dfx_active(logger):
+            spec_dfx_next_step()
+            sampled = (
+                valid_sampled_token_ids[:4].tolist()
+                if isinstance(valid_sampled_token_ids, torch.Tensor)
+                else valid_sampled_token_ids
+            )
+            spec_dfx_dump(
+                logger,
+                "A1.propose_entry",
+                num_reqs=self.input_batch.num_reqs,
+                req_ids=list(self.input_batch.req_ids[:4]),
+                valid_sampled=sampled,  # padded raw sampled ids; -1 = rejected/invalid
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
 
         # Reset cached draft probs from the previous step so that stale data
         # is never used when the drafter does not produce fresh probabilities.

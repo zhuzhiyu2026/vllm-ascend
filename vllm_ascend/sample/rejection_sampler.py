@@ -21,6 +21,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.spec_dfx import (
+    active as spec_dfx_active,
+    dump as spec_dfx_dump,
+)
 from vllm_ascend.ops.triton.v1.reject_sample import (
     _REJECTION_RANDOM_SAMPLE_BLOCK_VERIFY_KERNEL,
     _REJECTION_RANDOM_SAMPLE_KERNEL,
@@ -185,6 +189,36 @@ class AscendRejectionSampler(RejectionSampler):
         )
 
         self._log_rejection_sampler_entry(logits, metadata)
+
+        # [spec/dfx2] C: what the verifier actually receives. pos0_match is the
+        # key bisect metric: draft row 0's first proposal vs the target argmax
+        # on the same verify row. Always False with sane drafts => proposer/
+        # alignment bug. Mostly True with accepted=0 at exit => sampler bug.
+        if spec_dfx_active(logger):
+            nd = metadata.num_draft_tokens
+            host_nd = [int(x) for x in (nd.tolist() if torch.is_tensor(nd) else nd)]
+            drafts = metadata.draft_token_ids
+            tgt_argmax = logits[metadata.target_logits_indices].argmax(dim=-1)
+            pos0_match = None
+            if torch.is_tensor(drafts) and host_nd and host_nd[0] > 0:
+                pos0_match = bool(drafts[0].item() == tgt_argmax[0].item())
+            spec_dfx_dump(
+                logger,
+                "C.verify_entry",
+                host_num_draft_tokens=host_nd[:4],
+                cu_num_draft_tokens=metadata.cu_num_draft_tokens[:4],
+                drafts0=(drafts[: host_nd[0] + (host_nd[1] if len(host_nd) > 1 else 0)] if torch.is_tensor(drafts) else drafts),
+                target_argmax0=tgt_argmax[:8],
+                pos0_match=pos0_match,
+                all_greedy=sampling_metadata.all_greedy,
+                all_random=sampling_metadata.all_random,
+                block_verify=bool(
+                    metadata.max_spec_len >= 3
+                    and get_ascend_config().rejection_sampler_config.enable_block_verify
+                ),
+                entropy_verify=bool(get_ascend_config().rejection_sampler_config.enable_entropy_verify),
+            )
+
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -239,7 +273,7 @@ class AscendRejectionSampler(RejectionSampler):
             ori_target_logits=raw_target_logits,
         )
 
-        self._log_rejection_sampler_exit(output_token_ids, metadata)
+        self._log_rejection_sampler_exit(output_token_ids, metadata, bonus_token_ids)
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -292,6 +326,7 @@ class AscendRejectionSampler(RejectionSampler):
         self,
         output_token_ids: torch.Tensor,
         metadata: SpecDecodeMetadata,
+        bonus_token_ids: torch.Tensor | None = None,
     ) -> None:
         """DFX exit probe (acceptance signal) for rejection sampling.
 
@@ -320,6 +355,20 @@ class AscendRejectionSampler(RejectionSampler):
             num_total_drafts,
             100.0 * num_accepted / max(num_total_drafts + output_token_ids.shape[0], 1),
         )
+
+        # [spec/dfx2] D: post-verification output rows (placeholders included).
+        # bonus is the discriminator for the all-placeholder row: a row whose
+        # device-side num_draft_tokens is 0 gets ONLY the bonus written, so
+        # bonus == -1 (DP-dummy / discarded request) reproduces 0% slot fill.
+        if spec_dfx_active(logger):
+            spec_dfx_dump(
+                logger,
+                "D.verify_exit",
+                output_rows=output_token_ids[:2],
+                batch_size=output_token_ids.shape[0],
+                bonus=bonus_token_ids[:4] if bonus_token_ids is not None else None,
+                all_placeholder=num_accepted == 0 and num_slots > 0,
+            )
 
 
 def apply_sampling_constraints(
@@ -377,6 +426,41 @@ def apply_sampling_constraints(
         )
 
     return apply_top_k_top_p(logits, k, p)
+
+
+def _backstop_fully_discarded_rows(
+    output_token_ids: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    num_draft_tokens,
+    batch_size: int,
+) -> None:
+    """[spec/dfx2] Structural guarantee: every request row must emit at least
+    one valid token per step, otherwise the engine appends nothing and the
+    sequence freezes. Restore the target's own sampled token (bonus) at pos 0
+    for fully-discarded rows. Rows with nd == 0 (DP padding) are backstopped
+    silently; rows with real drafts raise a WARNING.
+    """
+    valid_per_row = output_token_ids.ne(PLACEHOLDER_TOKEN_ID).any(dim=1)
+    bad_rows = (~valid_per_row).nonzero(as_tuple=True)[0]
+    if bad_rows.numel() == 0:
+        return
+    output_token_ids[bad_rows, 0] = bonus_token_ids[bad_rows, 0].to(output_token_ids.dtype)
+    nd_t = torch.as_tensor(num_draft_tokens, device=output_token_ids.device)
+    real_bad = bad_rows[nd_t[bad_rows] > 0]
+    if real_bad.numel() > 0:
+        logger.warning(
+            "[spec/dfx2] structural backstop: %d row(s) with real drafts were fully "
+            "discarded by the verify kernels; restored bonus token at pos 0 (rows=%s)",
+            real_bad.numel(),
+            real_bad.tolist()[:8],
+        )
+    spec_dfx_dump(
+        logger,
+        "D.backstop",
+        restored_rows=bad_rows.tolist()[:8],
+        restored_count=int(bad_rows.numel()),
+        real_rows=real_bad.tolist()[:8] if real_bad.numel() > 0 else None,
+    )
 
 
 def rejection_sample(
@@ -451,7 +535,7 @@ def rejection_sample(
         )
     posterior_threshold = float(get_ascend_config().rejection_sampler_config.posterior_threshold)
     posterior_alpha = float(get_ascend_config().rejection_sampler_config.posterior_alpha)
-    logger.debug_once(
+    logger.debug(
         "[sample/rejection_sampler] Rejection sampling path: "
         "block_verify=%s, entropy_verify=%s, all_greedy=%s, all_random=%s, "
         "triton=%s",
@@ -496,7 +580,7 @@ def rejection_sample(
         ).to(torch.float32)
 
     if using_block_verify or using_entropy_verify:
-        logger.info_once(
+        logger.info(
             "RejectionSampler config: block_verify=%s, entropy_verify=%s, "
             "posterior_threshold=%s, posterior_alpha=%s, "
             "has_triton=%s, all_greedy=%s, all_random=%s",
@@ -555,6 +639,9 @@ def rejection_sample(
                     synthetic_mode=synthetic_mode,
                 )
         if sampling_metadata.all_greedy:
+            _backstop_fully_discarded_rows(
+                output_token_ids, bonus_token_ids, num_draft_tokens, batch_size
+            )
             return output_token_ids
 
     # For random sampling
@@ -686,8 +773,10 @@ def rejection_sample(
                 ori_target_probs=ori_target_probs,
             )
 
+    _backstop_fully_discarded_rows(
+        output_token_ids, bonus_token_ids, num_draft_tokens, batch_size
+    )
     return output_token_ids
-
 
 def expand_batch_to_tokens(
     x: torch.Tensor,  # [batch_size]

@@ -71,6 +71,10 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataTask, DeviceMetadataTaskProvider
+from vllm_ascend.spec_dfx import (
+    active as spec_dfx_active,
+    dump as spec_dfx_dump,
+)
 from vllm_ascend.worker.v1.spec_decode.utils import (
     SlidingWindowAdapter,
     _maybe_eager_context,
@@ -1586,6 +1590,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_blk = logits.shape[0]
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
+
+                # [spec/dfx2] E: draft forward sanity -- poisoned logits here point
+                # at draft attention metadata / KV prepopulation, not the sampler.
+                if spec_dfx_active(logger):
+                    spec_dfx_dump(
+                        logger,
+                        "E.draft_logits",
+                        logits_shape=tuple(raw_logits.shape),
+                        finite=bool(torch.isfinite(raw_logits).all().item()),
+                        draft_argmax=logits[:2].argmax(-1),
+                        sample_from_anchor=self.sample_from_anchor,
+                    )
                 dspark_probs_list: list[torch.Tensor] = []
                 for idx in range(self.num_speculative_tokens):
                     markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
@@ -1638,6 +1654,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
 
         # Early exit if there is only one draft token to be generated.
+        # [spec/dfx2] B: seed + proposals exactly as the proposer produced them.
+        if spec_dfx_active(logger) and self.method == "dspark":
+            spec_dfx_dump(
+                logger,
+                "B.dspark_out",
+                parallel_drafting=self.parallel_drafting,
+                num_speculative_tokens=self.num_speculative_tokens,
+                draft_rows=draft_token_ids[:2],
+            )
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             if draft_probs_step0 is not None:
                 self._last_draft_probs = draft_probs_step0.view(
@@ -1648,6 +1673,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 # [batch_size, 1]
                 return draft_token_ids.view(-1, self.num_speculative_tokens)
+
+        # [spec/dfx2] F: dspark must never reach the sequential drafting loop --
+        # its anchor-parallel query layout (num_query_per_req == K, no anchor
+        # position) is structurally incompatible with it and drafts come out
+        # as garbage (symptom: acceptance rate pinned at 0).
+        if self.method == "dspark":
+            logger.warning_once(
+                "[spec/dfx2] dspark fell through to the SEQUENTIAL drafting loop: "
+                "parallel_drafting=False (num_speculative_tokens=%d). This is a "
+                "misconfiguration: set speculative_config.parallel_drafting=true.",
+                self.num_speculative_tokens,
+            )
 
         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
         # As a result, the batch size length becomes the actual length 32.
